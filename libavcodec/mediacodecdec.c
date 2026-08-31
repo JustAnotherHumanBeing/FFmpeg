@@ -1172,17 +1172,20 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     s->ctx->use_ndk_codec = s->use_ndk_codec;
     s->ctx->codec_profile = -1;
     if (s->dovi_surface_decoder) {
-        /* The Shield does not advertise Profile 7. Let configure(), rather
-         * than codec-list filtering, determine whether its vendor decoder
-         * accepts the explicitly requested experimental profile. */
-        if (!s->dovi_p7_probe_active)
-            s->ctx->codec_profile = s->dovi_surface_profile;
+        /* The Shield advertises the same vendor decoder for Profile 5, but
+         * not Profile 7. Use the advertised Profile 5 value only to select
+         * that decoder for the opt-in probe. The MediaFormat below still
+         * requests Profile 7, so configure() remains the acceptance check. */
+        s->ctx->codec_profile = s->dovi_p7_probe_active ?
+                               MEDIACODEC_DOVI_PROFILE_DVHE_STN :
+                               s->dovi_surface_profile;
         ff_AMediaFormat_setInt32(format, "profile", s->dovi_surface_profile);
         av_log(avctx, AV_LOG_INFO,
                "Requesting the Android Dolby Vision surface decoder "
-               "(stream profile=%u, MediaCodec profile=%d)\n",
+               "(stream profile=%u, MediaCodec profile=%d, "
+               "codec-list profile=%d)\n",
                (unsigned)s->dovi_ctx.cfg.dv_profile,
-               s->dovi_surface_profile);
+               s->dovi_surface_profile, s->ctx->codec_profile);
     }
 
     if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
