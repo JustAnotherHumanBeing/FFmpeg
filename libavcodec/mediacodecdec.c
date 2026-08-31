@@ -56,6 +56,7 @@
 #define MEDIACODEC_DOVI_MAX_PENDING 512U
 /* MediaCodecInfo.CodecProfileLevel Dolby Vision profile values. */
 #define MEDIACODEC_DOVI_PROFILE_DVHE_STN 32
+#define MEDIACODEC_DOVI_PROFILE_DVHE_DTH 64
 #define MEDIACODEC_DOVI_PROFILE_DVHE_ST 256
 
 typedef struct MediaCodecDOVIFrame {
@@ -89,7 +90,9 @@ typedef struct MediaCodecH264DecContext {
 
     int dovi_p5_metadata;
     int dovi_surface_decoder;
+    int dovi_p7_surface_probe;
     int dovi_p5_active;
+    int dovi_p7_probe_active;
     int dovi_surface_profile;
     DOVIContext dovi_ctx;
     MediaCodecDOVIFrame *dovi_head;
@@ -147,6 +150,7 @@ static void mediacodec_dovi_set_config(AVCodecContext *avctx,
         ff_dovi_ctx_unref(&s->dovi_ctx);
         s->dovi_ctx.logctx = avctx;
         s->dovi_p5_active = 0;
+        s->dovi_p7_probe_active = 0;
         s->dovi_surface_profile = -1;
         av_log(avctx, AV_LOG_WARNING,
                "Dolby Vision processing is enabled, "
@@ -165,14 +169,24 @@ static void mediacodec_dovi_set_config(AVCodecContext *avctx,
                         cfg.dv_profile == 5 && cfg.bl_present_flag &&
                         cfg.rpu_present_flag && !cfg.el_present_flag;
 
+    s->dovi_p7_probe_active = 0;
     s->dovi_surface_profile = -1;
     if (avctx->codec_id == AV_CODEC_ID_HEVC && cfg.bl_present_flag &&
-        cfg.rpu_present_flag && !cfg.el_present_flag) {
-        if (cfg.dv_profile == 5) {
+        cfg.rpu_present_flag) {
+        if (cfg.dv_profile == 5 && !cfg.el_present_flag) {
             s->dovi_surface_profile = MEDIACODEC_DOVI_PROFILE_DVHE_STN;
         } else if (cfg.dv_profile == 8 &&
-                   cfg.dv_bl_signal_compatibility_id == 1) {
+                   cfg.dv_bl_signal_compatibility_id == 1 &&
+                   !cfg.el_present_flag) {
             s->dovi_surface_profile = MEDIACODEC_DOVI_PROFILE_DVHE_ST;
+        } else if (cfg.dv_profile == 7 && cfg.el_present_flag &&
+                   s->dovi_p7_surface_probe) {
+            s->dovi_surface_profile = MEDIACODEC_DOVI_PROFILE_DVHE_DTH;
+            s->dovi_p7_probe_active = 1;
+            av_log(avctx, AV_LOG_WARNING,
+                   "Probing unadvertised Android Dolby Vision Profile 7 "
+                   "surface decoding; correct enhancement-layer "
+                   "reconstruction is not assumed\n");
         }
     }
 
@@ -190,7 +204,8 @@ static void mediacodec_dovi_set_config(AVCodecContext *avctx,
     if (s->dovi_surface_decoder && s->dovi_surface_profile < 0) {
         av_log(avctx, AV_LOG_VERBOSE,
                "Dolby Vision surface decoding is limited to single-layer "
-               "Profile 5 and Profile 8.1; %s configuration has profile=%u "
+               "Profile 5 and Profile 8.1 unless the Profile 7 probe is "
+               "enabled; %s configuration has profile=%u "
                "compatibility-id=%u BL=%u EL=%u RPU=%u\n",
                source, (unsigned)cfg.dv_profile,
                (unsigned)cfg.dv_bl_signal_compatibility_id,
@@ -1004,7 +1019,8 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     if (s->dovi_surface_decoder && s->dovi_surface_profile < 0) {
         av_log(avctx, AV_LOG_VERBOSE,
                "Stream is not supported single-layer Dolby Vision Profile 5 "
-               "or Profile 8.1; using ordinary MediaCodec output\n");
+               "or Profile 8.1, or an enabled dual-layer Profile 7 probe; "
+               "using ordinary MediaCodec output\n");
         s->dovi_surface_decoder = 0;
     }
 
@@ -1156,7 +1172,11 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     s->ctx->use_ndk_codec = s->use_ndk_codec;
     s->ctx->codec_profile = -1;
     if (s->dovi_surface_decoder) {
-        s->ctx->codec_profile = s->dovi_surface_profile;
+        /* The Shield does not advertise Profile 7. Let configure(), rather
+         * than codec-list filtering, determine whether its vendor decoder
+         * accepts the explicitly requested experimental profile. */
+        if (!s->dovi_p7_probe_active)
+            s->ctx->codec_profile = s->dovi_surface_profile;
         ff_AMediaFormat_setInt32(format, "profile", s->dovi_surface_profile);
         av_log(avctx, AV_LOG_INFO,
                "Requesting the Android Dolby Vision surface decoder "
@@ -1383,6 +1403,10 @@ static const AVOption ff_mediacodec_vdec_options[] = {
     { "dovi_surface_decoder", "Use Android's Dolby Vision decoder for "
             "supported single-layer surface output",
             OFFSET(dovi_surface_decoder), AV_OPT_TYPE_BOOL,
+            {.i64 = 0}, 0, 1, VD },
+    { "dovi_p7_surface_probe", "Probe unsupported dual-layer Dolby Vision "
+            "Profile 7 surface decoding",
+            OFFSET(dovi_p7_surface_probe), AV_OPT_TYPE_BOOL,
             {.i64 = 0}, 0, 1, VD },
     { "dovi_p5_surface_decoder", "Deprecated alias for dovi_surface_decoder",
             OFFSET(dovi_surface_decoder), AV_OPT_TYPE_BOOL,
