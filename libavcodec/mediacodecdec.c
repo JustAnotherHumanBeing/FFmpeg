@@ -54,6 +54,8 @@
 #include "mediacodecdec_common.h"
 
 #define MEDIACODEC_DOVI_MAX_PENDING 512
+/* MediaCodecInfo.CodecProfileLevel.DolbyVisionProfileDvheStn. */
+#define MEDIACODEC_DOVI_PROFILE_DVHE_STN 32
 
 typedef struct MediaCodecDOVIFrame {
     struct MediaCodecDOVIFrame *next;
@@ -85,6 +87,7 @@ typedef struct MediaCodecH264DecContext {
     int dovi_packet_offset;
 
     int dovi_p5_metadata;
+    int dovi_p5_surface_decoder;
     int dovi_p5_active;
     DOVIContext dovi_ctx;
     MediaCodecDOVIFrame *dovi_head;
@@ -121,7 +124,7 @@ static void mediacodec_dovi_queue_clear(MediaCodecH264DecContext *s)
 
 static void mediacodec_dovi_flush(MediaCodecH264DecContext *s)
 {
-    if (!s->dovi_p5_metadata)
+    if (!s->dovi_p5_metadata && !s->dovi_p5_surface_decoder)
         return;
 
     mediacodec_dovi_queue_clear(s);
@@ -135,7 +138,7 @@ static void mediacodec_dovi_set_config(AVCodecContext *avctx,
     MediaCodecH264DecContext *s = avctx->priv_data;
     AVDOVIDecoderConfigurationRecord cfg;
 
-    if (!s->dovi_p5_metadata)
+    if (!s->dovi_p5_metadata && !s->dovi_p5_surface_decoder)
         return;
 
     if (!data || size < sizeof(cfg)) {
@@ -143,7 +146,7 @@ static void mediacodec_dovi_set_config(AVCodecContext *avctx,
         s->dovi_ctx.logctx = avctx;
         s->dovi_p5_active = 0;
         av_log(avctx, AV_LOG_WARNING,
-               "Dolby Vision Profile 5 metadata propagation is enabled, "
+               "Dolby Vision Profile 5 processing is enabled, "
                "but %s configuration is missing or truncated\n", source);
         return;
     }
@@ -301,7 +304,8 @@ static int mediacodec_dovi_parse_packet(AVCodecContext *avctx,
     int ret = 0;
     int64_t pts;
 
-    if (!s->dovi_p5_metadata || avctx->codec_id != AV_CODEC_ID_HEVC)
+    if (s->dovi_p5_surface_decoder || !s->dovi_p5_metadata ||
+        avctx->codec_id != AV_CODEC_ID_HEVC)
         return 0;
 
     config = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF,
@@ -412,7 +416,7 @@ static int mediacodec_dovi_attach(AVCodecContext *avctx, AVFrame *frame)
     int had_metadata;
     int had_rpu;
 
-    if (!s->dovi_p5_metadata)
+    if (s->dovi_p5_surface_decoder || !s->dovi_p5_metadata)
         return 0;
 
     item = mediacodec_dovi_queue_take(s, frame->pts);
@@ -949,8 +953,14 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     FFAMediaFormat *format = NULL;
     MediaCodecH264DecContext *s = avctx->priv_data;
 
+    if (s->dovi_p5_surface_decoder && avctx->codec_id != AV_CODEC_ID_HEVC) {
+        av_log(avctx, AV_LOG_ERROR,
+               "The Dolby Vision surface decoder is only available for HEVC\n");
+        return AVERROR(EINVAL);
+    }
+
     s->dovi_ctx.logctx = avctx;
-    if (s->dovi_p5_metadata) {
+    if (s->dovi_p5_metadata || s->dovi_p5_surface_decoder) {
         dovi_config = ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
         mediacodec_dovi_set_config(avctx,
                                    dovi_config ? dovi_config->data : NULL,
@@ -996,7 +1006,18 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 #endif
 #if CONFIG_HEVC_MEDIACODEC_DECODER
     case AV_CODEC_ID_HEVC:
-        codec_mime = "video/hevc";
+        if (s->dovi_p5_surface_decoder) {
+            if (!s->dovi_p5_active) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "The Dolby Vision surface decoder is limited to "
+                       "single-layer Profile 5\n");
+                ret = AVERROR(EINVAL);
+                goto done;
+            }
+            codec_mime = "video/dolby-vision";
+        } else {
+            codec_mime = "video/hevc";
+        }
 
         ret = hevc_set_extradata(avctx, format);
         if (ret < 0)
@@ -1100,9 +1121,25 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 
     s->ctx->delay_flush = s->delay_flush;
     s->ctx->use_ndk_codec = s->use_ndk_codec;
+    s->ctx->codec_profile = -1;
+    if (s->dovi_p5_surface_decoder) {
+        s->ctx->codec_profile = MEDIACODEC_DOVI_PROFILE_DVHE_STN;
+        ff_AMediaFormat_setInt32(format, "profile",
+                                 MEDIACODEC_DOVI_PROFILE_DVHE_STN);
+        av_log(avctx, AV_LOG_INFO,
+               "Requesting the Android Dolby Vision Profile 5 surface decoder\n");
+    }
 
     if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
         s->ctx = NULL;
+        goto done;
+    }
+
+    if (s->dovi_p5_surface_decoder && !s->ctx->surface) {
+        av_log(avctx, AV_LOG_ERROR,
+               "The Dolby Vision decoder option requires a MediaCodec "
+               "output surface\n");
+        ret = AVERROR(EINVAL);
         goto done;
     }
 
@@ -1308,6 +1345,10 @@ static const AVOption ff_mediacodec_vdec_options[] = {
             OFFSET(dovi_diagnostics), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
     { "dovi_p5_metadata", "Propagate single-layer Dolby Vision Profile 5 metadata",
             OFFSET(dovi_p5_metadata), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
+    { "dovi_p5_surface_decoder", "Use Android's Dolby Vision decoder for "
+            "single-layer Profile 5 surface output",
+            OFFSET(dovi_p5_surface_decoder), AV_OPT_TYPE_BOOL,
+            {.i64 = 0}, 0, 1, VD },
     { NULL }
 };
 

@@ -41,6 +41,7 @@ typedef struct MediaCodecDecContext {
     atomic_int hw_buffer_count;
 
     char *codec_name;
+    int codec_profile;
 
     FFAMediaCodec *codec;
     FFAMediaFormat *format;

@@ -772,7 +772,8 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
         }
     }
 
-    profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
+    profile = s->codec_profile >= 0 ? s->codec_profile :
+              ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
     if (profile < 0) {
         av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
     }
