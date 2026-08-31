@@ -27,17 +27,24 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
+#include "libavutil/dovi_meta.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/internal.h"
+#include "libavutil/sha.h"
 
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "decode.h"
 #include "h264_parse.h"
 #include "h264_ps.h"
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+#include "h2645_parse.h"
+#include "hevc/hevc.h"
+#endif
 #include "hevc/parse.h"
 #include "hwconfig.h"
 #include "internal.h"
@@ -59,7 +66,200 @@ typedef struct MediaCodecH264DecContext {
     int use_ndk_codec;
     // Ref. MediaFormat KEY_OPERATING_RATE
     int operating_rate;
+
+    int dovi_diagnostics;
+    struct AVSHA *dovi_sha;
+    uint64_t dovi_packet_id;
+    int dovi_packet_size;
+    int dovi_packet_offset;
 } MediaCodecH264DecContext;
+
+static void mediacodec_dovi_log_config(AVCodecContext *avctx)
+{
+    const AVPacketSideData *sd =
+        ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
+
+    if (!sd) {
+        av_log(avctx, AV_LOG_INFO,
+               "[dovi-diag] coded configuration: absent\n");
+        return;
+    }
+    if (sd->size < sizeof(AVDOVIDecoderConfigurationRecord)) {
+        av_log(avctx, AV_LOG_WARNING,
+               "[dovi-diag] coded configuration: truncated (%zu < %zu)\n",
+               sd->size, sizeof(AVDOVIDecoderConfigurationRecord));
+        return;
+    }
+
+    const AVDOVIDecoderConfigurationRecord *cfg = (const void *)sd->data;
+    av_log(avctx, AV_LOG_INFO,
+           "[dovi-diag] coded configuration: version=%u.%u profile=%u "
+           "level=%u compatibility-id=%u BL=%u EL=%u RPU=%u compression=%u\n",
+           cfg->dv_version_major, cfg->dv_version_minor, cfg->dv_profile,
+           cfg->dv_level, cfg->dv_bl_signal_compatibility_id,
+           cfg->bl_present_flag, cfg->el_present_flag,
+           cfg->rpu_present_flag, cfg->dv_md_compression);
+}
+
+static void mediacodec_dovi_hash_rpu(MediaCodecH264DecContext *s,
+                                     const uint8_t *data, size_t size,
+                                     char hash[17])
+{
+    uint8_t digest[32];
+
+    av_sha_init(s->dovi_sha, 256);
+    av_sha_update(s->dovi_sha, data, size);
+    av_sha_final(s->dovi_sha, digest);
+    for (int i = 0; i < 8; i++)
+        snprintf(hash + i * 2, 3, "%02x", digest[i]);
+}
+
+static void mediacodec_dovi_log_packet(AVCodecContext *avctx,
+                                       const AVPacket *pkt)
+{
+    MediaCodecH264DecContext *s = avctx->priv_data;
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    H2645Packet h2645_pkt = { 0 };
+    int au_count = 0;
+    int el_count = 0;
+    int rpu_count = 0;
+    int vcl_count = 0;
+    int ret;
+#endif
+
+    s->dovi_packet_id++;
+    s->dovi_packet_size = pkt->size;
+    s->dovi_packet_offset = 0;
+
+    av_log(avctx, AV_LOG_INFO,
+           "[dovi-diag] input packet=%"PRIu64" pts=%"PRId64
+           " dts=%"PRId64" duration=%"PRId64" size=%d key=%d timebase=%d/%d\n",
+           s->dovi_packet_id, pkt->pts, pkt->dts, pkt->duration, pkt->size,
+           !!(pkt->flags & AV_PKT_FLAG_KEY), avctx->pkt_timebase.num,
+           avctx->pkt_timebase.den);
+
+#if CONFIG_HEVC_MEDIACODEC_DECODER
+    if (avctx->codec_id == AV_CODEC_ID_HEVC && pkt->size > 0) {
+        ret = ff_h2645_packet_split(&h2645_pkt, pkt->data, pkt->size,
+                                    avctx, 0, AV_CODEC_ID_HEVC,
+                                    H2645_FLAG_SMALL_PADDING);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "[dovi-diag] packet=%"PRIu64
+                   " Annex-B NAL split failed: %d\n",
+                   s->dovi_packet_id, ret);
+            goto done;
+        }
+
+        for (int i = 0; i < h2645_pkt.nb_nals; i++) {
+            const H2645NAL *nal = &h2645_pkt.nals[i];
+
+            if (nal->type >= 0 && nal->type <= 31) {
+                vcl_count++;
+                if (nal->size > 2 && (nal->data[2] & 0x80))
+                    au_count++;
+            } else if (nal->type == HEVC_NAL_UNSPEC63) {
+                el_count++;
+            } else if (nal->type == HEVC_NAL_UNSPEC62) {
+                char hash[17] = "unavailable";
+
+                rpu_count++;
+                if (nal->raw_size > 2) {
+                    mediacodec_dovi_hash_rpu(s, nal->raw_data + 2,
+                                             nal->raw_size - 2, hash);
+                    av_log(avctx, AV_LOG_INFO,
+                           "[dovi-diag] packet=%"PRIu64" RPU=%d size=%d "
+                           "sha256-prefix=%s layer=%d temporal=%d\n",
+                           s->dovi_packet_id, rpu_count,
+                           nal->raw_size - 2, hash, nal->nuh_layer_id,
+                           nal->temporal_id);
+                } else {
+                    av_log(avctx, AV_LOG_WARNING,
+                           "[dovi-diag] packet=%"PRIu64
+                           " RPU=%d is truncated (raw-size=%d)\n",
+                           s->dovi_packet_id, rpu_count, nal->raw_size);
+                }
+            }
+        }
+
+        if (!au_count && vcl_count)
+            au_count = 1;
+
+        av_log(avctx, AV_LOG_INFO,
+               "[dovi-diag] packet=%"PRIu64
+               " nals=%d access-units=%d VCL=%d RPU=%d EL=%d\n",
+               s->dovi_packet_id, h2645_pkt.nb_nals, au_count,
+               vcl_count, rpu_count, el_count);
+
+done:
+        ff_h2645_packet_uninit(&h2645_pkt);
+    }
+#endif
+}
+
+static void mediacodec_dovi_log_formats(AVCodecContext *avctx,
+                                        const char *mime,
+                                        FFAMediaFormat *requested)
+{
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    MediaCodecDecContext *ctx = s->ctx;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
+    char *requested_string = ff_AMediaFormat_toString(requested);
+    char *output_string = ctx->format ?
+        ff_AMediaFormat_toString(ctx->format) : NULL;
+    void *hdr_static = NULL;
+    void *hdr_dynamic = NULL;
+    size_t hdr_static_size = 0;
+    size_t hdr_dynamic_size = 0;
+    int32_t dataspace = 0;
+    int32_t requested_bit_depth = 0;
+    int32_t output_bit_depth = 0;
+    int32_t color_range = 0;
+    int32_t color_standard = 0;
+    int32_t color_transfer = 0;
+
+    ff_AMediaFormat_getInt32(requested, "bit-depth", &requested_bit_depth);
+
+    if (ctx->format) {
+        ff_AMediaFormat_getBuffer(ctx->format, "hdr-static-info",
+                                  &hdr_static, &hdr_static_size);
+        ff_AMediaFormat_getBuffer(ctx->format, "hdr10-plus-info",
+                                  &hdr_dynamic, &hdr_dynamic_size);
+        if (!ff_AMediaFormat_getInt32(ctx->format, "data-space", &dataspace))
+            ff_AMediaFormat_getInt32(ctx->format, "android._dataspace", &dataspace);
+        ff_AMediaFormat_getInt32(ctx->format, "bit-depth", &output_bit_depth);
+        ff_AMediaFormat_getInt32(ctx->format, "color-range", &color_range);
+        ff_AMediaFormat_getInt32(ctx->format, "color-standard", &color_standard);
+        ff_AMediaFormat_getInt32(ctx->format, "color-transfer", &color_transfer);
+    }
+
+    av_log(avctx, AV_LOG_INFO,
+           "[dovi-diag] MediaCodec init: mime=%s decoder=%s API=%s path=%s "
+           "profile=%d level=%d bits-per-raw-sample=%d output-pixfmt=%s "
+           "components=%d color-format=%#x stride=%d slice-height=%d "
+           "crop=%d,%d-%d,%d requested-bit-depth=%d output-bit-depth=%d "
+           "range=%d standard=%d transfer=%d dataspace=%d "
+           "hdr-static=%zu hdr-dynamic=%zu\n",
+           mime, ctx->codec_name, ctx->use_ndk_codec ? "NDK" : "JNI",
+           ctx->surface ? "surface" : "copy", avctx->profile, avctx->level,
+           avctx->bits_per_raw_sample,
+           av_get_pix_fmt_name(avctx->pix_fmt) ?
+               av_get_pix_fmt_name(avctx->pix_fmt) : "unknown",
+           desc ? desc->nb_components : 0, ctx->color_format, ctx->stride,
+           ctx->slice_height, ctx->crop_left, ctx->crop_top,
+           ctx->crop_right, ctx->crop_bottom, requested_bit_depth,
+           output_bit_depth, color_range, color_standard, color_transfer, dataspace,
+           hdr_static_size, hdr_dynamic_size);
+    av_log(avctx, AV_LOG_INFO,
+           "[dovi-diag] requested MediaFormat: %s\n",
+           requested_string ? requested_string : "unavailable");
+    av_log(avctx, AV_LOG_INFO,
+           "[dovi-diag] output MediaFormat: %s\n",
+           output_string ? output_string : "unavailable");
+
+    av_free(requested_string);
+    av_free(output_string);
+}
 
 static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
 {
@@ -69,6 +269,7 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
     s->ctx = NULL;
 
     av_packet_unref(&s->buffered_pkt);
+    av_freep(&s->dovi_sha);
 
     return 0;
 }
@@ -315,6 +516,13 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     FFAMediaFormat *format = NULL;
     MediaCodecH264DecContext *s = avctx->priv_data;
 
+    if (s->dovi_diagnostics) {
+        s->dovi_sha = av_sha_alloc();
+        if (!s->dovi_sha)
+            return AVERROR(ENOMEM);
+        mediacodec_dovi_log_config(avctx);
+    }
+
     if (s->use_ndk_codec < 0)
         s->use_ndk_codec = !av_jni_get_java_vm(avctx);
 
@@ -456,6 +664,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         goto done;
     }
 
+    if (s->dovi_diagnostics)
+        mediacodec_dovi_log_formats(avctx, codec_mime, format);
+
     av_log(avctx, AV_LOG_INFO,
            "MediaCodec started successfully: codec = %s, ret = %d\n",
            s->ctx->codec_name, ret);
@@ -528,8 +739,20 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 
         /* try to flush any buffered packet data */
         if (s->buffered_pkt.size > 0) {
+            const int packet_size_before_send = s->buffered_pkt.size;
+
             ret = ff_mediacodec_dec_send(avctx, s->ctx, &s->buffered_pkt, false);
             if (ret >= 0) {
+                if (s->dovi_diagnostics) {
+                    av_log(avctx, AV_LOG_INFO,
+                           "[dovi-diag] packet=%"PRIu64" input chunk "
+                           "offset=%d size=%d remaining=%d split=%d\n",
+                           s->dovi_packet_id, s->dovi_packet_offset, ret,
+                           packet_size_before_send - ret,
+                           ret < packet_size_before_send ||
+                           s->dovi_packet_offset > 0);
+                    s->dovi_packet_offset += ret;
+                }
                 s->buffered_pkt.size -= ret;
                 s->buffered_pkt.data += ret;
                 if (s->buffered_pkt.size <= 0) {
@@ -555,6 +778,10 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
         ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
         if (ret == AVERROR_EOF) {
             AVPacket null_pkt = { 0 };
+            if (s->dovi_diagnostics)
+                av_log(avctx, AV_LOG_INFO,
+                       "[dovi-diag] end of input after packet=%"PRIu64"\n",
+                       s->dovi_packet_id);
             ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
             if (ret < 0)
                 return ret;
@@ -564,6 +791,9 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
         } else if (ret < 0) {
             return ret;
         }
+
+        if (s->dovi_diagnostics)
+            mediacodec_dovi_log_packet(avctx, &s->buffered_pkt);
     }
 
     return AVERROR(EAGAIN);
@@ -573,7 +803,15 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
 {
     MediaCodecH264DecContext *s = avctx->priv_data;
 
+    if (s->dovi_diagnostics)
+        av_log(avctx, AV_LOG_INFO,
+               "[dovi-diag] decoder flush after packet=%"PRIu64
+               " buffered=%d offset=%d\n",
+               s->dovi_packet_id, s->buffered_pkt.size,
+               s->dovi_packet_offset);
     av_packet_unref(&s->buffered_pkt);
+    s->dovi_packet_size = 0;
+    s->dovi_packet_offset = 0;
 
     ff_mediacodec_dec_flush(avctx, s->ctx);
 }
@@ -600,6 +838,8 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                    OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
     { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",
             OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
+    { "dovi_diagnostics", "Log Dolby Vision and MediaCodec packet/frame diagnostics",
+            OFFSET(dovi_diagnostics), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
     { NULL }
 };
 
