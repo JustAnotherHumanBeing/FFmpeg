@@ -53,7 +53,7 @@
 #include "mediacodec_wrapper.h"
 #include "mediacodecdec_common.h"
 
-#define MEDIACODEC_DOVI_MAX_PENDING 512
+#define MEDIACODEC_DOVI_MAX_PENDING 512U
 /* MediaCodecInfo.CodecProfileLevel Dolby Vision profile values. */
 #define MEDIACODEC_DOVI_PROFILE_DVHE_STN 32
 #define MEDIACODEC_DOVI_PROFILE_DVHE_ST 256
@@ -181,8 +181,10 @@ static void mediacodec_dovi_set_config(AVCodecContext *avctx,
                "Dolby Vision metadata propagation is limited to "
                "single-layer Profile 5; %s configuration has profile=%u "
                "BL=%u EL=%u RPU=%u\n",
-               source, cfg.dv_profile, cfg.bl_present_flag,
-               cfg.el_present_flag, cfg.rpu_present_flag);
+               source, (unsigned)cfg.dv_profile,
+               (unsigned)cfg.bl_present_flag,
+               (unsigned)cfg.el_present_flag,
+               (unsigned)cfg.rpu_present_flag);
     }
 
     if (s->dovi_surface_decoder && s->dovi_surface_profile < 0) {
@@ -190,9 +192,11 @@ static void mediacodec_dovi_set_config(AVCodecContext *avctx,
                "Dolby Vision surface decoding is limited to single-layer "
                "Profile 5 and Profile 8.1; %s configuration has profile=%u "
                "compatibility-id=%u BL=%u EL=%u RPU=%u\n",
-               source, cfg.dv_profile, cfg.dv_bl_signal_compatibility_id,
-               cfg.bl_present_flag, cfg.el_present_flag,
-               cfg.rpu_present_flag);
+               source, (unsigned)cfg.dv_profile,
+               (unsigned)cfg.dv_bl_signal_compatibility_id,
+               (unsigned)cfg.bl_present_flag,
+               (unsigned)cfg.el_present_flag,
+               (unsigned)cfg.rpu_present_flag);
     }
 }
 
@@ -550,10 +554,15 @@ static void mediacodec_dovi_log_config(AVCodecContext *avctx)
     av_log(avctx, AV_LOG_INFO,
            "[dovi-diag] coded configuration: version=%u.%u profile=%u "
            "level=%u compatibility-id=%u BL=%u EL=%u RPU=%u compression=%u\n",
-           cfg.dv_version_major, cfg.dv_version_minor, cfg.dv_profile,
-           cfg.dv_level, cfg.dv_bl_signal_compatibility_id,
-           cfg.bl_present_flag, cfg.el_present_flag,
-           cfg.rpu_present_flag, cfg.dv_md_compression);
+           (unsigned)cfg.dv_version_major,
+           (unsigned)cfg.dv_version_minor,
+           (unsigned)cfg.dv_profile,
+           (unsigned)cfg.dv_level,
+           (unsigned)cfg.dv_bl_signal_compatibility_id,
+           (unsigned)cfg.bl_present_flag,
+           (unsigned)cfg.el_present_flag,
+           (unsigned)cfg.rpu_present_flag,
+           (unsigned)cfg.dv_md_compression);
 }
 
 static void mediacodec_dovi_hash_rpu(MediaCodecH264DecContext *s,
@@ -1152,7 +1161,8 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_INFO,
                "Requesting the Android Dolby Vision surface decoder "
                "(stream profile=%u, MediaCodec profile=%d)\n",
-               s->dovi_ctx.cfg.dv_profile, s->dovi_surface_profile);
+               (unsigned)s->dovi_ctx.cfg.dv_profile,
+               s->dovi_surface_profile);
     }
 
     if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
