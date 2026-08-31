@@ -954,9 +954,10 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     MediaCodecH264DecContext *s = avctx->priv_data;
 
     if (s->dovi_p5_surface_decoder && avctx->codec_id != AV_CODEC_ID_HEVC) {
-        av_log(avctx, AV_LOG_ERROR,
-               "The Dolby Vision surface decoder is only available for HEVC\n");
-        return AVERROR(EINVAL);
+        av_log(avctx, AV_LOG_VERBOSE,
+               "Dolby Vision surface decoding does not apply to this codec; "
+               "using ordinary MediaCodec output\n");
+        s->dovi_p5_surface_decoder = 0;
     }
 
     s->dovi_ctx.logctx = avctx;
@@ -966,6 +967,12 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
                                    dovi_config ? dovi_config->data : NULL,
                                    dovi_config ? dovi_config->size : 0,
                                    "coded-stream");
+    }
+    if (s->dovi_p5_surface_decoder && !s->dovi_p5_active) {
+        av_log(avctx, AV_LOG_VERBOSE,
+               "Stream is not single-layer Dolby Vision Profile 5; using "
+               "ordinary MediaCodec output\n");
+        s->dovi_p5_surface_decoder = 0;
     }
 
     if (s->dovi_diagnostics) {
@@ -1007,13 +1014,6 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 #if CONFIG_HEVC_MEDIACODEC_DECODER
     case AV_CODEC_ID_HEVC:
         if (s->dovi_p5_surface_decoder) {
-            if (!s->dovi_p5_active) {
-                av_log(avctx, AV_LOG_ERROR,
-                       "The Dolby Vision surface decoder is limited to "
-                       "single-layer Profile 5\n");
-                ret = AVERROR(EINVAL);
-                goto done;
-            }
             codec_mime = "video/dolby-vision";
         } else {
             codec_mime = "video/hevc";
