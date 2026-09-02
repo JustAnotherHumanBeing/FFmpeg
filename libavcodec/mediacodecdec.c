@@ -99,6 +99,7 @@ typedef struct MediaCodecH264DecContext {
     MediaCodecDOVIFrame *dovi_tail;
     unsigned dovi_pending;
     uint64_t dovi_input_id;
+    int dovi_queue_pressure_warned;
 } MediaCodecH264DecContext;
 
 #if CONFIG_HEVC_MEDIACODEC_DECODER
@@ -125,6 +126,7 @@ static void mediacodec_dovi_queue_clear(MediaCodecH264DecContext *s)
     s->dovi_head = NULL;
     s->dovi_tail = NULL;
     s->dovi_pending = 0;
+    s->dovi_queue_pressure_warned = 0;
 }
 
 static void mediacodec_dovi_flush(MediaCodecH264DecContext *s)
@@ -238,10 +240,22 @@ static int mediacodec_dovi_queue_push(AVCodecContext *avctx, int64_t pts,
     MediaCodecDOVIFrame *item;
 
     if (s->dovi_pending >= MEDIACODEC_DOVI_MAX_PENDING) {
-        av_log(avctx, AV_LOG_ERROR,
-               "Dolby Vision metadata queue reached its %u-frame limit\n",
-               MEDIACODEC_DOVI_MAX_PENDING);
-        return AVERROR(ENOBUFS);
+        MediaCodecDOVIFrame *stale = s->dovi_head;
+
+        av_assert0(stale);
+        s->dovi_head = stale->next;
+        if (!s->dovi_head)
+            s->dovi_tail = NULL;
+        s->dovi_pending--;
+        mediacodec_dovi_frame_free(stale);
+
+        if (!s->dovi_queue_pressure_warned) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "Dolby Vision metadata queue reached its %u-frame limit; "
+                   "discarding stale metadata without stopping playback\n",
+                   MEDIACODEC_DOVI_MAX_PENDING);
+            s->dovi_queue_pressure_warned = 1;
+        }
     }
 
     item = av_mallocz(sizeof(*item));
@@ -359,12 +373,15 @@ static int mediacodec_dovi_parse_packet(AVCodecContext *avctx,
     if (!s->dovi_p5_active || pkt->size <= 0)
         return 0;
 
+    pts = mediacodec_dovi_output_pts(avctx, pkt);
+
     ret = ff_h2645_packet_split(&h2645_pkt, pkt->data, pkt->size, avctx, 0,
                                 AV_CODEC_ID_HEVC, H2645_FLAG_SMALL_PADDING);
     if (ret < 0) {
         av_log(avctx, AV_LOG_WARNING,
                "Unable to inspect HEVC packet for Dolby Vision metadata: %s\n",
                av_err2str(ret));
+        ret = mediacodec_dovi_queue_push(avctx, pts, NULL, NULL);
         goto done;
     }
 
@@ -377,8 +394,6 @@ static int mediacodec_dovi_parse_packet(AVCodecContext *avctx,
             goto done;
         }
     }
-
-    pts = mediacodec_dovi_output_pts(avctx, pkt);
 
     for (int i = 0; i < h2645_pkt.nb_nals; i++) {
         const H2645NAL *nal = &h2645_pkt.nals[i];
