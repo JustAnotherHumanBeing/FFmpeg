@@ -149,6 +149,7 @@ static void mediacodec_dovi_set_config(AVCodecContext *avctx,
         return;
 
     if (!data || size < sizeof(cfg)) {
+        mediacodec_dovi_queue_clear(s);
         ff_dovi_ctx_unref(&s->dovi_ctx);
         s->dovi_ctx.logctx = avctx;
         s->dovi_p5_active = 0;
@@ -163,6 +164,9 @@ static void mediacodec_dovi_set_config(AVCodecContext *avctx,
     memcpy(&cfg, data, sizeof(cfg));
 
     if (memcmp(&s->dovi_ctx.cfg, &cfg, sizeof(cfg))) {
+        // Queued metadata belongs to the previous coded-stream
+        // configuration and must never be attached after a transition.
+        mediacodec_dovi_queue_clear(s);
         ff_dovi_ctx_flush(&s->dovi_ctx);
         s->dovi_ctx.cfg = cfg;
     }
